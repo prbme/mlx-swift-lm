@@ -1702,6 +1702,15 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures = embedVision(imageFeatures)
         imageFeatures = imageFeatures.asType(inputsEmbeds.dtype)
 
+        // The vision tower returns one batch row per image. The prompt
+        // holds N * seqLen placeholder tokens for N images, so flatten the
+        // per-image rows into a single sequence (batch order matches
+        // placeholder order) before the count check and scatter below.
+        if imageFeatures.dim(0) > 1 {
+            imageFeatures = imageFeatures.reshaped(
+                1, imageFeatures.dim(0) * imageFeatures.dim(1), imageFeatures.dim(2))
+        }
+
         let imageMask = inputIds .== config.imageTokenId
         let expectedImageTokens = imageMask.asType(.int32).sum().item(Int.self)
 
@@ -1808,7 +1817,8 @@ public struct Gemma4Processor: UserInputProcessor {
         MLXArray, THW
     ) {
         var userProcessing = processing ?? UserInput.Processing()
-        let targetSize = config.fixedSize
+        let targetSize = config.fixedSize(
+            for: images.first?.extent.size ?? CGSize(width: 1, height: 1))
         userProcessing.resize = targetSize
 
         let processedImages = images.map { image in
@@ -1919,11 +1929,19 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         (imageStd[0], imageStd[1], imageStd[2])
     }
 
-    public var fixedSize: CGSize {
+    public func fixedSize(for imageSize: CGSize) -> CGSize {
         if let size {
             return CGSize(width: size.width, height: size.height)
         }
-        // 800x800 keeps the patch count under Gemma4's 280 * 3^2 vision budget.
-        return CGSize(width: 800, height: 800)
+        // 960x672 (or transposed for portrait) makes the pooler arithmetic
+        // exact: 60x42 = 2520 patches, kernel sqrt(2520/280) = 3, pooled
+        // grid 20x14 = exactly 280 cells with full spatial coverage. The
+        // previous 800x800 default produced 2500 patches, the inferred
+        // kernel truncated to 2, and the 25x25 = 625 pooled cells overran
+        // the 280-class one-hot — every cell past index 279 (the bottom
+        // ~55% of the image) was silently dropped.
+        return imageSize.height > imageSize.width
+            ? CGSize(width: 672, height: 960)
+            : CGSize(width: 960, height: 672)
     }
 }
